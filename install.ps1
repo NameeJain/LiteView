@@ -2,9 +2,9 @@
 #
 #   irm https://raw.githubusercontent.com/NameeJain/LiteView/master/install.ps1 | iex
 #
-# Downloads LiteView, installs Python and Tailscale if needed, signs this computer
-# in to Tailscale, opens the firewall port, makes LiteView start at login, and
-# starts it now. Re-run it to update.
+# Works on locked-down corporate laptops: no admin needed for install,
+# no .exe to block, no Python installer — uses portable embedded Python.
+# Only needs admin elevation for WDA hook (SeDebugPrivilege).
 
 & {
 $ErrorActionPreference = 'Stop'
@@ -14,11 +14,16 @@ $Repo = 'NameeJain/LiteView'
 $Dir = Join-Path $env:LOCALAPPDATA 'LiteView'
 $Port = 8765
 $Log = Join-Path $HOME '.liteview.log'
+$PyVer = '3.12.7'  # embedded Python version to download
 
 function Say($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Warn($msg) { Write-Host "    $msg" -ForegroundColor Yellow }
 
 function Find-Python {
+    # 1. Check our own portable Python first
+    $portable = Join-Path $Dir "python-$PyVer\python.exe"
+    if (Test-Path $portable) { return $portable }
+    # 2. Check system Python
     $probes = @(
         { py -3 -c 'import sys; print(sys.executable)' },
         { python -c 'import sys; print(sys.executable)' }
@@ -29,9 +34,39 @@ function Find-Python {
             if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path $exe.Trim())) { return $exe.Trim() }
         } catch {}
     }
-    $fallback = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
-    if (Test-Path $fallback) { return $fallback }
     return $null
+}
+
+function Install-PortablePython {
+    $pyDir = Join-Path $Dir "python-$PyVer"
+    if (Test-Path (Join-Path $pyDir 'python.exe')) { return (Join-Path $pyDir 'python.exe') }
+
+    Say "Downloading portable Python $PyVer (no install needed)..."
+    $pyZip = Join-Path $env:TEMP "python-$PyVer-embed-amd64.zip"
+    Invoke-WebRequest "https://www.python.org/ftp/python/$PyVer/python-$PyVer-embed-amd64.zip" -OutFile $pyZip -UseBasicParsing
+
+    New-Item -ItemType Directory -Force $pyDir | Out-Null
+    Expand-Archive $pyZip $pyDir -Force
+    Remove-Item $pyZip -Force -ErrorAction SilentlyContinue
+
+    # Enable pip: uncomment "import site" in python3XX._pth
+    $pth = Get-ChildItem $pyDir -Filter 'python*._pth' | Select-Object -First 1
+    if ($pth) {
+        $content = Get-Content $pth.FullName
+        $content = $content -replace '^#\s*import site', 'import site'
+        # Also add Lib\site-packages so pip-installed packages are found
+        $content += 'Lib\site-packages'
+        Set-Content $pth.FullName $content
+    }
+
+    # Bootstrap pip
+    Say 'Bootstrapping pip...'
+    $getPip = Join-Path $env:TEMP 'get-pip.py'
+    Invoke-WebRequest 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPip -UseBasicParsing
+    & (Join-Path $pyDir 'python.exe') $getPip --no-warn-script-location 2>&1 | Out-Null
+    Remove-Item $getPip -Force -ErrorAction SilentlyContinue
+
+    return (Join-Path $pyDir 'python.exe')
 }
 
 function Find-Tailscale {
@@ -40,7 +75,6 @@ function Find-Tailscale {
         Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 }
 
-# Returns Tailscale's state (Running, NeedsLogin, Stopped, ...) or $null if its service isn't reachable.
 function Get-TailscaleState($exe) {
     try {
         $json = (& $exe status --json 2>$null) -join "`n"
@@ -50,27 +84,12 @@ function Get-TailscaleState($exe) {
 }
 
 try {
-    # ---- Python -------------------------------------------------------------
-    $py = Find-Python
-    if (-not $py) {
-        Say 'Python not found - installing Python 3.12 with winget...'
-        try {
-            winget install -e --id Python.Python.3.12 --scope user --silent `
-                --accept-package-agreements --accept-source-agreements | Out-Host
-        } catch {}
-        $py = Find-Python
-        if (-not $py) {
-            throw 'Could not install Python automatically. Install it from https://www.python.org/downloads/ and run this command again.'
-        }
-    }
-    Say "Using Python: $py"
-
     # ---- stop a running copy so its files can be replaced ----------------------
-    Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" |
+    Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like "*$Dir*host.py*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-    # ---- download ---------------------------------------------------------------
+    # ---- download LiteView -----------------------------------------------------
     Say "Downloading LiteView to $Dir ..."
     $zip = Join-Path $env:TEMP 'liteview.zip'
     $unpacked = Join-Path $env:TEMP 'liteview-unpacked'
@@ -82,18 +101,44 @@ try {
     Copy-Item (Join-Path $src.FullName '*') $Dir -Recurse -Force
     Remove-Item $zip, $unpacked -Recurse -Force -ErrorAction SilentlyContinue
 
-    # ---- virtualenv + packages ------------------------------------------------
-    Say 'Installing Python packages (first time takes a minute)...'
-    $venvPy = Join-Path $Dir '.venv\Scripts\python.exe'
-    $venvPyw = Join-Path $Dir '.venv\Scripts\pythonw.exe'
-    if (-not (Test-Path $venvPy)) {
-        & $py -m venv (Join-Path $Dir '.venv')
-        if ($LASTEXITCODE) { throw 'Creating the Python virtual environment failed.' }
+    # ---- Python ----------------------------------------------------------------
+    $py = Find-Python
+    if (-not $py) {
+        # No system Python — download portable embedded Python (just a zip, no installer)
+        $py = Install-PortablePython
     }
-    & $venvPy -m pip install --disable-pip-version-check -q -r (Join-Path $Dir 'requirements.txt')
-    if ($LASTEXITCODE) { throw 'Installing Python packages failed (see the messages above).' }
+    Say "Using Python: $py"
 
-    # ---- capture-bypass binaries (clears WDA for browsers so Netflix works) ---
+    # ---- install packages -------------------------------------------------------
+    Say 'Installing Python packages (first time takes a minute)...'
+    $pyDir = Split-Path $py
+    $pip = Join-Path $pyDir 'Scripts\pip.exe'
+    # For portable Python, pip is in Scripts subfolder
+    if (-not (Test-Path $pip)) { $pip = Join-Path $pyDir 'Scripts\pip3.exe' }
+
+    # If using portable Python (no venv needed - install directly)
+    $isPortable = $py -like "*$Dir*python-*"
+    if ($isPortable) {
+        & $py -m pip install --disable-pip-version-check -q -r (Join-Path $Dir 'requirements.txt') 2>&1 | Out-Host
+        if ($LASTEXITCODE) { throw 'Installing Python packages failed.' }
+        $runPy = $py
+        $runPyw = Join-Path (Split-Path $py) 'pythonw.exe'
+        if (-not (Test-Path $runPyw)) { $runPyw = $py }
+    } else {
+        # System Python — use venv as before
+        $venvPy = Join-Path $Dir '.venv\Scripts\python.exe'
+        $venvPyw = Join-Path $Dir '.venv\Scripts\pythonw.exe'
+        if (-not (Test-Path $venvPy)) {
+            & $py -m venv (Join-Path $Dir '.venv')
+            if ($LASTEXITCODE) { throw 'Creating the Python virtual environment failed.' }
+        }
+        & $venvPy -m pip install --disable-pip-version-check -q -r (Join-Path $Dir 'requirements.txt')
+        if ($LASTEXITCODE) { throw 'Installing Python packages failed.' }
+        $runPy = $venvPy
+        $runPyw = $venvPyw
+    }
+
+    # ---- capture-bypass binaries ------------------------------------------------
     Say 'Downloading capture-bypass (DRM-video bypass)...'
     $cbDir = Join-Path $Dir 'capture-bypass'
     New-Item -ItemType Directory -Force $cbDir | Out-Null
@@ -111,13 +156,13 @@ try {
         Remove-Item $cbZip, $cbUnpacked -Recurse -Force -ErrorAction SilentlyContinue
         Say 'capture-bypass ready.'
     } catch {
-        Warn "capture-bypass download failed (DRM video in browsers may show as black): $($_.Exception.Message)"
+        Warn "capture-bypass download failed: $($_.Exception.Message)"
     }
 
     # ---- Tailscale: install and sign in -------------------------------------------
     $tailscale = Find-Tailscale
     if (-not $tailscale) {
-        Say 'Installing Tailscale (click Yes on the Windows prompt)...'
+        Say 'Installing Tailscale...'
         try {
             winget install -e --id Tailscale.Tailscale --silent `
                 --accept-package-agreements --accept-source-agreements | Out-Host
@@ -130,20 +175,17 @@ try {
     }
     $tsConnected = $false
     if ($tailscale) {
-        # A freshly installed Tailscale service can take a few seconds to start.
         for ($i = 0; $i -lt 15 -and -not (Get-TailscaleState $tailscale); $i++) { Start-Sleep -Seconds 2 }
         if ((Get-TailscaleState $tailscale) -ne 'Running') {
             Say 'Connecting this computer to Tailscale...'
             Warn 'If a link appears below, open it and sign in with the SAME Tailscale account'
-            Warn 'you use on the other computer. The install continues once you have signed in.'
-            # --unattended keeps Tailscale connected at boot, even before anyone logs in.
+            Warn 'you use on the other computer.'
             & $tailscale up --unattended
             if ($LASTEXITCODE -and (Get-TailscaleState $tailscale) -ne 'Running') { & $tailscale up }
         }
         $tsConnected = (Get-TailscaleState $tailscale) -eq 'Running'
         if (-not $tsConnected) {
-            Warn 'Tailscale is not connected, so LiteView will only work on this local network.'
-            Warn 'Re-run this command after signing in to Tailscale to enable access over the internet.'
+            Warn 'Tailscale is not connected. LiteView will only work on the local network.'
         }
     }
 
@@ -152,36 +194,37 @@ try {
     if ($tsConnected) { $hostArgs += '--tailscale-only' }
     $argLine = $hostArgs -join ' '
 
-    # ---- firewall (one UAC prompt, only the first time) --------------------------
+    # ---- firewall ----------------------------------------------------------------
     if (-not (Get-NetFirewallRule -DisplayName 'LiteView' -ErrorAction SilentlyContinue)) {
-        Say 'Opening the firewall for LiteView (click Yes on the Windows prompt)...'
-        # The venv launcher starts the real interpreter, which is what actually listens.
-        $baseDir = Split-Path (& $venvPy -c 'import sys; print(sys._base_executable)')
-        $programs = @((Join-Path $baseDir 'python.exe'), (Join-Path $baseDir 'pythonw.exe'))
-        $cmd = "foreach (`$p in @('" + (($programs | ForEach-Object { $_ -replace "'", "''" }) -join "','") + "')) { " +
-               "New-NetFirewallRule -DisplayName 'LiteView' -Direction Inbound -Action Allow -Protocol TCP " +
-               "-LocalPort $Port -RemoteAddress LocalSubnet,100.64.0.0/10 -Program `$p -Profile Any | Out-Null }"
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+        Say 'Opening the firewall for LiteView...'
         try {
+            $baseExe = & $runPy -c 'import sys; print(sys._base_executable)' 2>$null
+            if (-not $baseExe) { $baseExe = $runPy }
+            $baseDir = Split-Path $baseExe
+            $programs = @((Join-Path $baseDir 'python.exe'), (Join-Path $baseDir 'pythonw.exe'))
+            $cmd = "foreach (`$p in @('" + (($programs | ForEach-Object { $_ -replace "'", "''" }) -join "','") + "')) { " +
+                   "if (Test-Path `$p) { New-NetFirewallRule -DisplayName 'LiteView' -Direction Inbound -Action Allow -Protocol TCP " +
+                   "-LocalPort $Port -RemoteAddress LocalSubnet,100.64.0.0/10 -Program `$p -Profile Any | Out-Null } }"
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
             Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden `
                 -ArgumentList '-NoProfile', '-EncodedCommand', $encoded
         } catch {
-            Warn 'Firewall prompt was declined. If connecting fails, re-run this command and click Yes.'
+            Warn 'Firewall prompt was declined. If connecting fails, re-run and click Yes.'
         }
     }
 
-    # ---- start at login ---------------------------------------------------------
+    # ---- start at login ----------------------------------------------------------
     Say 'Making LiteView start automatically when you log in...'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut(
         (Join-Path ([Environment]::GetFolderPath('Startup')) 'LiteView.lnk'))
-    $shortcut.TargetPath = $venvPyw
+    $shortcut.TargetPath = $runPyw
     $shortcut.Arguments = $argLine
     $shortcut.WorkingDirectory = $Dir
     $shortcut.Save()
 
-    # ---- start now ----------------------------------------------------------------
-    Say 'Starting LiteView in the background...'
-    $proc = Start-Process $venvPyw -ArgumentList $argLine -WorkingDirectory $Dir -PassThru
+    # ---- start now ---------------------------------------------------------------
+    Say 'Starting LiteView...'
+    $proc = Start-Process $runPy -ArgumentList "`"$hostPy`"" -WorkingDirectory $Dir -PassThru
     Start-Sleep -Seconds 4
     if ($proc.HasExited) {
         Warn "LiteView stopped right after starting. Last lines of $Log :"
@@ -190,13 +233,13 @@ try {
     }
 
     Write-Host ''
-    Write-Host 'LiteView is running. On the other computer, open:' -ForegroundColor Green
+    Write-Host 'LiteView is running! On the other computer, open:' -ForegroundColor Green
     $showArgs = @($hostPy, '--show-address')
     if ($tsConnected) { $showArgs += '--tailscale-only' }
-    & $venvPy @showArgs
+    & $runPy @showArgs
     Write-Host ''
     Write-Host "It starts automatically at every login. Log file: $Log"
-    Write-Host 'To stop it: Task Manager -> end "pythonw.exe". To remove it from startup:'
+    Write-Host "To stop it: Task Manager -> end 'python.exe'. To remove from startup:"
     Write-Host '  Remove-Item "$([Environment]::GetFolderPath(''Startup''))\LiteView.lnk"'
 } catch {
     Write-Host "LiteView install failed: $($_.Exception.Message)" -ForegroundColor Red

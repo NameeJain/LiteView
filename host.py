@@ -27,7 +27,12 @@ from pynput.keyboard import Key, KeyCode
 from pynput.mouse import Button
 from pynput.mouse import Controller as MouseController
 
-HERE = Path(__file__).resolve().parent
+# When bundled by PyInstaller, data files are extracted to sys._MEIPASS.
+# At dev time, they sit next to host.py.
+if getattr(sys, 'frozen', False):
+    HERE = Path(sys._MEIPASS)
+else:
+    HERE = Path(__file__).resolve().parent
 
 # Optional: thirdeye captures protected windows (WDA_EXCLUDEFROMCAPTURE).
 # Try the installed wheel first; fall back to the local module_2 copy.
