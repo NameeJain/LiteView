@@ -1,0 +1,5 @@
+aiohttp
+pillow
+pynput
+eye3
+dxcam; sys_platform == "win32"

@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LiteView</title>
+<style>
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 14px system-ui, sans-serif; overflow: hidden; }
+  #bar { height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: #222; border-bottom: 1px solid #333; }
+  #status { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button { background: #333; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
+  button:hover { background: #444; }
+  #captureBadge { font-size: 11px; padding: 2px 7px; border-radius: 3px; font-weight: 600; letter-spacing: .3px; white-space: nowrap; }
+  #captureBadge.thirdeye { background: #1a3a1a; color: #5f5; border: 1px solid #3a6a3a; }
+  #captureBadge.mss { background: #2a2a2a; color: #999; border: 1px solid #444; }
+  #stage { position: absolute; top: 32px; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; }
+  body.fs #bar { display: none; }
+  body.fs #stage { top: 0; }
+  canvas { max-width: 100%; max-height: 100%; cursor: default; outline: none; image-rendering: auto; }
+  #login { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #111; }
+  #login form { display: flex; flex-direction: column; gap: 10px; padding: 24px; background: #1c1c1c; border: 1px solid #333; border-radius: 8px; width: min(320px, 90vw); }
+  #login input { padding: 8px; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; font-size: 15px; }
+  #login h1 { margin: 0 0 4px; font-size: 18px; }
+  #err { color: #f77; min-height: 1em; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span id="status">Not connected</span>
+  <span id="captureBadge" hidden></span>
+  <button id="fsBtn" title="Fullscreen also captures keys like Alt+Tab and Win (Chrome/Edge)">Fullscreen</button>
+  <button id="discBtn">Disconnect</button>
+</div>
+<div id="stage"><canvas id="screen" tabindex="0"></canvas></div>
+<div id="login">
+  <form id="loginForm">
+    <h1>LiteView</h1>
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password" autofocus>
+    <button type="submit">Connect</button>
+    <div id="err"></div>
+  </form>
+</div>
+
+<script>
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const loginEl = document.getElementById('login');
+const errEl = document.getElementById('err');
+const captureBadge = document.getElementById('captureBadge');
+
+let ws = null;
+let password = '';
+let authed = false;
+let wantConnected = false;
+let thirdEyeStatus = '';
+let frames = 0, bytes = 0;
+let captureBackend = '';
+
+function showCaptureBadge(backend) {
+  captureBackend = backend || 'mss';
+  captureBadge.textContent = captureBackend === 'thirdeye' ? 'ThirdEye' : 'mss';
+  captureBadge.className = captureBackend === 'thirdeye' ? 'thirdeye' : 'mss';
+  captureBadge.title = captureBackend === 'thirdeye'
+    ? 'Capturing via ThirdEye (bypasses WDA_EXCLUDEFROMCAPTURE)'
+    : 'Capturing via mss (standard GDI)';
+  captureBadge.hidden = false;
+}
+
+function refreshStatus() {
+  if (authed) {
+    let label = `Connected to ${location.host} · ${frames} fps · ${(bytes / 1024).toFixed(0)} KB/s`;
+    if (thirdEyeStatus) label += ` · ${thirdEyeStatus}`;
+    statusEl.textContent = label;
+  }
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN && authed) ws.send(JSON.stringify(obj));
+}
+
+function connect() {
+  if (ws) ws.close();
+  authed = false;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const sock = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = sock;
+  sock.binaryType = 'blob';
+  statusEl.textContent = 'Connecting…';
+
+  sock.onopen = () => sock.send(JSON.stringify({ t: 'auth', pw: password }));
+
+  sock.onmessage = async (e) => {
+    if (sock !== ws) return;  // a newer connection replaced this one
+    if (typeof e.data === 'string') {
+      const msg = JSON.parse(e.data);
+      if (msg.t === 'ok') {
+        authed = true;
+        showCaptureBadge(msg.capture);
+        loginEl.hidden = true;
+        canvas.focus();
+      } else if (msg.t === 'module') {
+        thirdEyeStatus = msg.enabled ? `ThirdEye ${msg.status || 'active'}` : 'ThirdEye inactive';
+        refreshStatus();
+      } else if (msg.t === 'error') {
+        wantConnected = false;
+        showLogin(msg.msg);
+      }
+      return;
+    }
+    bytes += e.data.size;
+    const bmp = await createImageBitmap(e.data);
+    if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+      canvas.width = bmp.width;
+      canvas.height = bmp.height;
+    }
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+    frames++;
+    sock.send('{"t":"ack"}');
+  };
+
+  sock.onclose = () => {
+    if (sock !== ws) return;
+    authed = false;
+    if (wantConnected) {
+      statusEl.textContent = 'Connection lost — reconnecting…';
+      setTimeout(connect, 2000);
+    } else {
+      statusEl.textContent = 'Not connected';
+    }
+  };
+}
+
+function showLogin(message) {
+  loginEl.hidden = false;
+  errEl.textContent = message || '';
+  document.getElementById('pw').focus();
+}
+
+document.getElementById('loginForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  password = document.getElementById('pw').value;
+  errEl.textContent = '';
+  wantConnected = true;
+  connect();
+});
+
+document.getElementById('discBtn').onclick = () => {
+  wantConnected = false;
+  if (ws) ws.close();
+  ws = null;
+  captureBadge.hidden = true;
+  showLogin();
+};
+
+document.getElementById('fsBtn').onclick = async () => {
+  await document.documentElement.requestFullscreen();
+  if (navigator.keyboard && navigator.keyboard.lock) {
+    try { await navigator.keyboard.lock(); } catch (_) {}
+  }
+  canvas.focus();
+};
+document.addEventListener('fullscreenchange', () => {
+  document.body.classList.toggle('fs', !!document.fullscreenElement);
+});
+
+setInterval(() => {
+  if (authed) {
+    refreshStatus();
+  }
+  frames = 0; bytes = 0;
+}, 1000);
+
+// ---- mouse -------------------------------------------------------------
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+}
+
+let pendingMove = null;
+canvas.addEventListener('mousemove', (e) => {
+  // Coalesce moves to one per animation frame.
+  if (!pendingMove) requestAnimationFrame(() => { send({ t: 'move', ...pendingMove }); pendingMove = null; });
+  pendingMove = pos(e);
+});
+canvas.addEventListener('mousedown', (e) => { e.preventDefault(); canvas.focus(); send({ t: 'down', b: e.button, ...pos(e) }); });
+canvas.addEventListener('mouseup', (e) => { e.preventDefault(); send({ t: 'up', b: e.button, ...pos(e) }); });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+let wheelX = 0, wheelY = 0;
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const scale = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1;
+  wheelX += e.deltaX * scale;
+  wheelY += e.deltaY * scale;
+  const stepsX = Math.trunc(wheelX / 100), stepsY = Math.trunc(wheelY / 100);
+  if (stepsX || stepsY) {
+    wheelX -= stepsX * 100;
+    wheelY -= stepsY * 100;
+    send({ t: 'wheel', dx: stepsX, dy: -stepsY });  // browser: +y is down; pynput: +y is up
+  }
+}, { passive: false });
+
+// ---- keyboard ----------------------------------------------------------
+window.addEventListener('keydown', (e) => {
+  if (!authed) return;
+  e.preventDefault();
+  send({ t: 'kd', code: e.code });
+});
+window.addEventListener('keyup', (e) => {
+  if (!authed) return;
+  e.preventDefault();
+  send({ t: 'ku', code: e.code });
+});
+window.addEventListener('blur', () => send({ t: 'releaseall' }));
+</script>
+</body>
+</html>
